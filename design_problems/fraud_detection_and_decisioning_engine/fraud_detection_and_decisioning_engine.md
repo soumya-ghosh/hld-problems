@@ -620,7 +620,7 @@ flowchart TD
     ICE -->|"training data"| SP
 ```
 
-![Mermaid Diagram](fraud_detection_hld.svg)
+![Mermaid Diagram](./fraud_detection_desgin.png)
 
 
 
