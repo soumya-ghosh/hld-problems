@@ -51,6 +51,38 @@ Design a sub-100ms, five-nines-available fraud detection system that ingests str
 | FR9 | Emit every decision to an audit log for regulatory compliance and model retraining |
 | FR10 | (Future) Incorporate graph-based fraud-ring scores without blocking the critical path |
 
+> **Q:** What are velocity counters in fraud detection context?
+>
+>> **A:** Velocity counters are sliding-window counts (or sums) of events for a given entity over a recent time window. They answer questions like: *"how many transactions has this user made in the last 10 minutes?"* or *"how much total spend from this card in the last 1 hour?"*
+>>
+>> They're one of the most powerful fraud signals because fraudsters, once they have a stolen card, tend to transact rapidly before it gets blocked.
+>>
+>> **Common velocity features used in this system (FR2 — "spend velocity"):**
+>>
+>> | Counter | Window | Signal |
+>> |---|---|---|
+>> | `txn_count_per_user` | 1 min, 5 min, 1 hr | Rapid-fire card testing |
+>> | `spend_sum_per_user` | 1 hr, 24 hr | Sudden spend spike |
+>> | `txn_count_per_card` | 10 min | Card enumeration attack |
+>> | `txn_count_per_merchant` | 1 min | Merchant-side bust-out fraud |
+>> | `distinct_ip_count_per_user` | 1 hr | Account takeover (multiple locations) |
+>> | `failed_auth_count_per_user` | 5 min | Brute-force credential stuffing |
+>>
+>> **Implementation in this doc (Redis):** Each counter is stored as a Redis key with a TTL equal to the window size. On each transaction, atomically `INCR` the counter and `EXPIRE` it if it doesn't exist. For sliding windows (not fixed tumbling), use a Redis sorted set: members are event timestamps, score is the timestamp — `ZREMRANGEBYSCORE` prunes entries older than `now - window`, `ZCARD` gives the count.
+>>
+>> ```
+>> # Fixed window (cheaper, slightly less accurate at window boundary)
+>> INCR  txn_count:user_123:5min
+>> EXPIRE txn_count:user_123:5min 300   # only if key is new
+>>
+>> # Sliding window (exact, more memory)
+>> ZADD  txn_ts:user_123 <now_ms> <event_id>
+>> ZREMRANGEBYSCORE txn_ts:user_123 0 <now_ms - 300000>
+>> ZCARD txn_ts:user_123   # = exact count in last 5 min
+>> ```
+>>
+>> The rule engine (FR3) then fires rules like `txn_count_5min > 10 → DENY` or `spend_sum_1hr > $2000 AND unverified_device → MFA`.
+
 ---
 
 ### Non-Functional Requirements
@@ -275,6 +307,31 @@ Redis Cluster topology: 6 nodes (3 primary + 3 replica), spread across 3 AZs. Re
 - TTL: 7 years per regulatory requirement.
 - Hot data (last 90 days) on NVMe nodes; older data compacted and tiered to cheaper storage.
 
+> **Q:** What is the purpose of storing decisions in Cassandra? What user flows could this data serve? All data along with decisions is already stored in Iceberg tables.
+>
+>> **A:** This is a fair challenge — and the honest answer is that **Cassandra here is serving operational/online query patterns that Iceberg fundamentally cannot serve**, not analytical ones.
+>>
+>> **Why Iceberg alone is insufficient:**
+>> Iceberg on S3 is a batch-oriented analytical store. A query like *"show me all fraud decisions for user X in the last 30 days"* on Iceberg requires: S3 object listing → Parquet file scan → filter. Even with partition pruning, this is 200ms–2s latency. Unacceptable for the following online flows:
+>>
+>> **User flows Cassandra serves that Iceberg cannot:**
+>>
+>> | Flow | Query pattern | Latency requirement |
+>> |---|---|---|
+>> | **Dispute resolution UI** (ops agent looks up why a transaction was denied) | `SELECT * FROM decisions WHERE user_id=X AND decision_date=today` | < 50ms |
+>> | **Customer-facing transaction history** (app shows user their flagged transactions) | Same partition key lookup | < 100ms |
+>> | **Fraud flag propagation check** (is this user currently flagged?) | Point lookup on `user_id` | < 10ms (could be Redis, but Cassandra is the durable source) |
+>> | **Regulatory audit export** (regulator asks for all decisions for user X) | Time-range scan on `(user_id, date)` | Seconds acceptable, but must be operational, not requiring a Spark job |
+>> | **Real-time rule feedback** (did this user get denied in the last 5 mins?) | Recent partition lookup | < 20ms |
+>>
+>> **The core distinction:**
+>> - **Iceberg** = source of truth for bulk/analytical access (model retraining, compliance batch exports, BI). Latency: seconds to minutes.
+>> - **Cassandra** = operational store for low-latency, key-scoped lookups by `user_id`. Latency: single-digit ms to 50ms.
+>>
+>> If you remove Cassandra, all of these flows either: (a) hit Iceberg and miss latency SLAs, or (b) get served from Redis — but Redis has no 7-year durability guarantee and is memory-expensive at that retention. Cassandra gives you durable, cheap (disk-based), sub-50ms key-lookup with TTL-based retention in one store.
+>>
+>> **Legitimate counterargument:** If you're comfortable with Apache Pinot or ClickHouse for operational analytics, you could replace Cassandra with one of those and serve both the analytical and operational query patterns. That's a valid simplification if the team already operates one.
+
 #### Raw Event Archive (Iceberg on S3)
 
 - All raw transaction events and decisions land in Apache Iceberg tables on S3.
@@ -391,6 +448,20 @@ For feature updates (velocity counters, spend averages), we accept eventual cons
 **ML Inference pod crash**: Circuit breaker (Resilience4j) trips after 5 consecutive failures or 50% error rate over 10s. Traffic falls back to **rules-only mode**: decisions are made purely from deterministic rules. Fraud capture rate drops but the system remains available. Alert fires immediately for on-call.
 
 **Region outage**: Active-active deployment in 2 regions (e.g., us-east-1, us-west-2). Each region has a full stack. Payment gateway routes to healthy region via DNS failover. Redis cross-region replication is asynchronous (CRDT-based via Redis Enterprise Active-Active) — slight inconsistency window during failover is acceptable given the short duration.
+
+> **Q:** What is DNS failover?
+>
+>> **A:** DNS failover is a mechanism where a DNS record's IP address is automatically switched from an unhealthy endpoint to a healthy one when a health check fails.
+>>
+>> In this context: the payment gateway has a hostname like `api.payments.example.com`. Normally that resolves to us-east-1's load balancer IP. A health checker pings us-east-1 every few seconds. If it fails N consecutive checks, the DNS record is updated to point to us-west-2's load balancer instead. Clients that re-resolve the hostname now hit the healthy region.
+>>
+>> **The catch — DNS TTL:** DNS records are cached by clients and resolvers for the duration of the TTL (time-to-live). If TTL is set to 60s, clients may keep hitting the dead region for up to 60s after failover. This is why critical services set DNS TTL to 30–60s (not the default 300s or higher). The "< 30s failover" claim in this doc is only achievable with a low TTL + fast health check interval.
+>>
+>> **How it compares to alternatives:**
+>> - **Anycast routing** (BGP-level): faster (~sub-second), used by CDNs/DNS providers themselves — not typically available to application-layer services
+>> - **Load balancer health checks** (e.g., AWS Global Accelerator, Cloudflare): similar outcome but routes at the network edge before DNS resolution — faster and more reliable than DNS TTL-based failover
+>>
+>> In production fraud/payment systems, AWS Route 53 health checks + low TTL (30s) or Global Accelerator are the standard approaches.
 
 **Bad model deployment**: New models deploy via shadow mode first — running in parallel with the current model, logging scores but not affecting decisions. Comparison dashboard monitors divergence. Full cutover only after 24h of shadow validation. Instant rollback by flipping a feature flag in Redis (`model_version: v1`).
 
@@ -548,6 +619,11 @@ flowchart TD
     GR -->|"graph_fraud_score"| RC
     ICE -->|"training data"| SP
 ```
+
+![Mermaid Diagram](fraud_detection_hld.svg)
+
+
+
 
 ---
 
