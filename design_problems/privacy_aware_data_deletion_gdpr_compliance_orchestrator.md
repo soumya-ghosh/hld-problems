@@ -139,16 +139,16 @@ RDBMS tasks (SQL DELETE):     ~40% of tasks → 600,000 DELETEs/day → ~7 DELET
 
 ```mermaid
 flowchart TD
-    A[User / Compliance Portal] -->|POST /v1/deletion-requests| B[Deletion Request API\nFastAPI + gRPC]
-    B --> C{Duplicate\nCheck?}
-    C -->|New| D[(deletion_requests\nPostgres — Regional)]
+    A[User / Compliance Portal] -->|POST /v1/deletion-requests| B[Deletion Request API<br>FastAPI + gRPC]
+    B --> C{Duplicate<br>Check?}
+    C -->|New| D[(deletion_requests<br>Postgres — Regional)]
     C -->|Duplicate| A
-    D --> E[Identity Resolution\nService]
-    E --> F[(identity_map\nPostgres)]
-    E --> G[Metadata Catalog\nApache Atlas / DataHub]
-    G --> H[Temporal Workflow Engine\nDeletion Orchestrator]
+    D --> E[Identity Resolution<br>Service]
+    E --> F[(identity_map<br>Postgres)]
+    E --> G[Metadata Catalog<br>Apache Atlas / DataHub]
+    G --> H[Temporal Workflow Engine<br>Deletion Orchestrator]
 
-    H -->|Activity per asset| I[Kafka\ndeletion-tasks-{region}]
+    H -->|Activity per asset| I["Kafka<br>deletion-tasks-{region}"]
 
     I --> W1[RDBMS Worker]
     I --> W2[Parquet Batch Worker]
@@ -156,26 +156,26 @@ flowchart TD
     I --> W4[Backup Expiry Worker]
     I --> W5[Cache Eviction Worker]
 
-    W1 --> DB1[(MySQL / Postgres\noperational DBs)]
-    W2 --> SP[Spark on K8s\nBatch Rewrite Job]
-    SP --> DL[(S3 + Apache Iceberg\nData Lake)]
+    W1 --> DB1[(MySQL / Postgres<br>operational DBs)]
+    W2 --> SP[Spark on K8s<br>Batch Rewrite Job]
+    SP --> DL[(S3 + Apache Iceberg<br>Data Lake)]
     W3 --> ES[(Elasticsearch)]
-    W4 --> GL[(S3 Glacier\nCold Backups)]
+    W4 --> GL[(S3 Glacier<br>Cold Backups)]
     W5 --> RC[(Redis / Memcached)]
 
     W1 & W2 & W3 & W4 & W5 -->|Activity Result| H
 
-    H -->|All Complete| CS[Certificate Service\nEd25519 Signing]
-    H -->|Max Retries Exceeded| ESC[Human Escalation\nPagerDuty + Jira]
+    H -->|All Complete| CS[Certificate Service<br>Ed25519 Signing]
+    H -->|Max Retries Exceeded| ESC[Human Escalation<br>PagerDuty + Jira]
 
-    CS --> S3C[(Certificate Store\nS3)]
-    CS --> NS[Notification Service\nSendGrid / SNS]
+    CS --> S3C[(Certificate Store<br>S3)]
+    CS --> NS[Notification Service<br>SendGrid / SNS]
     NS --> A
 
-    KV[HashiCorp Vault\nKMS / Crypto-Shred] -.->|DEK Destruction| W2
+    KV[HashiCorp Vault<br>KMS / Crypto-Shred] -.->|DEK Destruction| W2
     KV -.->|DEK Destruction| W4
 
-    AL[(Audit Log\nKafka → S3 Iceberg)] -.->|All Events| B & H & CS
+    AL[(Audit Log<br>Kafka → S3 Iceberg)] -.->|All Events| B & H & CS
 ```
 
 ---
