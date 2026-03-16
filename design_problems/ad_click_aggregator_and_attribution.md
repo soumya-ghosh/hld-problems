@@ -250,7 +250,7 @@ graph TD
     end
 
     subgraph Kafka Cluster - Per Region
-        KR[raw-events\n500 partitions]
+        KR[raw-events<br>500 partitions]
         KV[validated-events]
         KA[attributed-events]
         KM[aggregated-metrics]
@@ -267,18 +267,18 @@ graph TD
     subgraph State Stores
         RB[Redis Bloom Filter]
         RE[Redis Exact TTL Keys]
-        PG[PostgreSQL\nCampaign Metadata]
-        FS[Flink RocksDB State\nWindow State]
+        PG[PostgreSQL<br>Campaign Metadata]
+        FS[Flink RocksDB State<br>Window State]
     end
 
     subgraph Serving Layer
-        DR[Apache Druid\nReal-time OLAP]
-        ICE[Apache Iceberg on S3\nData Lake]
-        SPARK[Spark\nBatch Reconciliation]
+        DR[Apache Druid<br>Real-time OLAP]
+        ICE[Apache Iceberg on S3<br>Data Lake]
+        SPARK[Spark<br>Batch Reconciliation]
     end
 
     subgraph API Layer
-        KONG[Kong Gateway\nRate Limiting + Auth]
+        KONG[Kong Gateway<br>Rate Limiting + Auth]
         QS[Query Service]
         DASH[Advertiser Dashboard]
     end
@@ -307,7 +307,7 @@ graph TD
 
     DASH --> KONG --> QS --> DR
 
-    MM2[MirrorMaker 2\nCross-Region Replication]
+    MM2[MirrorMaker 2<br>Cross-Region Replication]
     KR -.->|async replication| MM2
 ```
 

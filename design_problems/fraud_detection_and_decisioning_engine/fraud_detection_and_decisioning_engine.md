@@ -561,39 +561,39 @@ The foundational architecture (Kafka → Flink → Feature Store → Rules + ML 
 
 ```mermaid
 flowchart TD
-    PG["Payment Gateway\n(external)"]
+    PG["Payment Gateway<br>(external)"]
 
     subgraph ingestion["Ingestion Layer"]
-        AG["Decision API Gateway\n(Envoy + mTLS)"]
-        KF["Kafka Cluster\n(partitioned by user_id)"]
+        AG["Decision API Gateway<br>(Envoy + mTLS)"]
+        KF["Kafka Cluster<br>(partitioned by user_id)"]
     end
 
     subgraph processing["Stream Processing (Flink)"]
-        FL["Flink Enrichment Job\n(async I/O)"]
-        RE["Rules Engine\n(Drools / custom DSL)"]
-        ML["ML Inference\n(Triton + ONNX XGBoost)"]
+        FL["Flink Enrichment Job<br>(async I/O)"]
+        RE["Rules Engine<br>(Drools / custom DSL)"]
+        ML["ML Inference<br>(Triton + ONNX XGBoost)"]
         DA["Decision Aggregator"]
     end
 
     subgraph feature_store["Feature Store"]
-        RC["Redis Cluster\n(user features, fraud flags\nvelocity counters)"]
-        AE["Aerospike\n(device/IP/merchant data)"]
+        RC["Redis Cluster<br>(user features, fraud flags<br>velocity counters)"]
+        AE["Aerospike<br>(device/IP/merchant data)"]
     end
 
     subgraph storage["Storage & Audit"]
-        CS["Cassandra\n(decision audit, 7yr)"]
-        ICE["Iceberg on S3\n(raw events + decisions)"]
+        CS["Cassandra<br>(decision audit, 7yr)"]
+        ICE["Iceberg on S3<br>(raw events + decisions)"]
     end
 
     subgraph offline["Offline Pipelines"]
-        SP["Spark Batch\n(feature engineering)"]
-        GR["Graph Compute\n(Spark GraphX / PyG)"]
+        SP["Spark Batch<br>(feature engineering)"]
+        GR["Graph Compute<br>(Spark GraphX / PyG)"]
     end
 
     subgraph secondary["Secondary Workflows"]
         MFA["MFA Challenge Service"]
         RV["Manual Review Queue"]
-        JG["JanusGraph\n(async BFS for fraud rings)"]
+        JG["JanusGraph<br>(async BFS for fraud rings)"]
     end
 
     PG -->|"HTTPS POST /evaluate"| AG
