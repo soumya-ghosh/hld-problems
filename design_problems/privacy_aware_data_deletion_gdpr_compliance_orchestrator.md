@@ -222,6 +222,63 @@ CREATE TABLE identity_map (
 );
 ```
 
+> **Q:** What purpose does identity_map serve? How is it different from data catalog like Datahub? Does identity_map store reference where PII data or user related informtion is stored in tables in data lake?
+>
+>> **A:** These are three distinct concerns handled by three different things — it's easy to conflate them.
+>>
+>> **`identity_map` — Who is this user in each system?**
+>>
+>> It answers: *"Given a canonical `user_id`, what is that user called in each downstream system?"*
+>>
+>> A user might be `user_id=abc123` in your auth system, but in the ad platform they're `device_id=idfa:xyz`, in the orders DB they have `customer_id=9876`, and in the analytics lake their events are tagged with `session_id=sess:...`. These are all the same human. `identity_map` is that translation table. Without it, the deletion worker hits `orders_db` with `user_id=abc123` and finds zero rows because that column doesn't exist there.
+>>
+>> It does **not** tell you which tables exist or where PII lives — that's DataHub's job.
+>>
+>> **DataHub / Atlas — What data assets exist and which contain PII?**
+>>
+>> It answers: *"Which tables/S3 prefixes/ES indices contain user-level PII, and what column holds the user identifier?"*
+>>
+>> DataHub stores asset-level metadata like:
+>> ```
+>> asset: orders_db.orders
+>>   pii: true
+>>   owner_id_column: customer_id
+>>   id_type: customer_id
+>>   storage_type: RDBMS
+>>   locator: jdbc:postgres://orders-db:5432/orders
+>> ```
+>> This is what the orchestrator queries to build the list of `deletion_tasks`. It's a schema/asset registry, not a per-user index.
+>>
+>> **How they work together at deletion time:**
+>>
+>> ```
+>> 1. DataHub says: "orders_db.orders has PII; owner column is customer_id"
+>> 2. identity_map says: "for user abc123, customer_id in orders_db = 9876"
+>> 3. Worker executes: DELETE FROM orders WHERE customer_id = 9876
+>> ```
+>>
+>> Neither alone is sufficient. DataHub without identity_map means you know *where* to delete but not *what value* to filter on. identity_map without DataHub means you have identifier translations but don't know which tables to target.
+>>
+>> **Does identity_map store references to where PII lives?**
+>>
+>> No. `identity_map` only stores `(canonical_user_id, system_id, external_id, id_type)` — the cross-system identity translation. The `system_id` column (e.g., `'orders_db'`) acts as a foreign key into DataHub's asset registry, but `identity_map` itself has no knowledge of table names, S3 paths, or schema structure. That's entirely DataHub's responsibility.
+
+> **Q:**: What if the user_id value, say during user registration, is user_id present in all other business tables? Do we still need identity_map?
+>
+>> **A:** If your org has perfect referential discipline — one `user_id` propagated consistently to every table, every Kafka event, every Parquet row, every ES document — then `identity_map` collapses to a single row per system with `external_id = user_id`. Mechanically you still need it, but it becomes trivially populated and almost useless.
+>>
+>> In practice, that ideal breaks in at least a few places:
+>>
+>> - **Third-party / acquired systems**: Ad platforms, CDP tools, CRM software — these assign their own IDs at ingestion. Your `user_id` may never reach them.
+>> - **Pre-auth events**: Analytics events fired before login (anonymous `device_id` or `session_id`) that later get linked to a `user_id` via identity stitching. That linkage lives in `identity_map`.
+>> - **Legacy data**: Tables written before the `user_id` standard was adopted often use `email` or `customer_number` as the key.
+>> - **Hashed/tokenized columns**: Some systems store `sha256(user_id)` or a tokenized surrogate for security reasons. The mapping from canonical `user_id` → token must be tracked somewhere.
+>>
+>> **Pragmatic answer:** If you're in a greenfield org with strong platform discipline where `user_id` is truly universal, you can skip `identity_map` and have the orchestrator derive the filter value directly from `user_id` for every asset. But you'd still need DataHub to annotate which column is the owner column per asset — and the moment one system deviates, you have no place to record the exception without rebuilding something equivalent to `identity_map`.
+>>
+>> It's cheap insurance. The table is small (one row per user per system), write-once, and prevents an edge case from becoming a compliance incident.
+
+
 ### `deletion_tasks`
 
 ```sql
@@ -245,6 +302,34 @@ CREATE TABLE deletion_tasks (
     completed_at        TIMESTAMPTZ,
     error_message       TEXT
 );
+
+> **Q:** What are the pros and cons of using UUIDs as primary keys for the `deletion_requests` and `deletion_tasks` tables versus using sequential serial IDs? Which choice is better for this architecture, and why?
+>
+> **A:**  
+> **UUID Primary Keys:**  
+> - **Pros:**  
+>   - Globally unique; removes risk of key collision across distributed/regional systems.  
+>   - Allows safe, concurrent ID generation without round-trips to the database.  
+>   - Facilitates data replication and cross-region workflows, as IDs can be generated application-side before persistence.  
+>   - Easier correlation across audit logs, external systems, and S3 objects by embedding request/task UUIDs in file names or messages.  
+> - **Cons:**  
+>   - Larger storage overhead compared to INT/BIGINT; slight impact on indexing performance.  
+>   - Alphabetical sort order may not reflect insert order (unless using time-ordered UUID v7 or similar).
+>
+> **Serial (Auto-Increment) IDs:**  
+> - **Pros:**  
+>   - Smaller and more compact; slightly faster indexes and joins in very large tables.  
+>   - Ordered by insert time; can be useful for paginating by time.
+> - **Cons:**  
+>   - Inherently local to a single database instance—harder to merge/replicate across regional databases.  
+>   - ID assignment is DB-side; can require callback/transaction to get new ID before further use.  
+>   - Prone to collisions or gaps if merging across partitions or restoring from backup.
+>
+> **Best Practice for This Orchestrator:**  
+> In a privacy and compliance context with regional partitioning, S3 certificate storage, and distributed workflows, **UUIDs are strongly preferred**. They allow safe, collision-free request/task tracking across all regions and make cross-system traceability easier. The small index overhead is negligible compared to reliability, auditability, and operational simplicity.  
+>
+> **Summary:**  
+> > Use UUID primary keys—not serial IDs—for `deletion_requests` and `deletion_tasks` tables in this architecture.
 
 CREATE INDEX idx_dt_request_id ON deletion_tasks (request_id);
 CREATE INDEX idx_dt_status_strategy ON deletion_tasks (status, deletion_strategy);
