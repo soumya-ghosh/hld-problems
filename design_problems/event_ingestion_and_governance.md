@@ -6,18 +6,19 @@
 **Context**: Your organization operates high-traffic mobile and web applications generating hundreds of billions of monthly events (clicks, impressions, page views). Currently, data is fragmented, schemas are inconsistent across app versions, and "bad data" often crashes downstream analytics. You are tasked with designing a holistic ingestion system that serves as the single entry point for all behavioral data, ensuring it is validated, cataloged, and stored in a high-performance Lakehouse architecture.
 
 1. High-Level Requirements
-Functional Requirements (FR)
-Multi-Source Ingestion: Support high-throughput data collection from mobile (iOS/Android) and web clients via SDKs or HTTP APIs.
-Schema Governance & Evolution: Implement a centralized Event Catalog and Schema Registry to manage event definitions and versioning across various app releases.
-Data Validation & Quarantine: Automatically validate incoming events against registered schemas; invalid events must be routed to a Dead Letter Queue (DLQ) or "Quarantine" zone for inspection without stopping the main pipeline.
-Open Lakehouse Storage: Persist ingested data into Apache Iceberg tables, supporting ACID transactions, schema evolution, and time-travel queries.Event Enrichment: Support basic at-ingest enrichment (e.g., Geo-IP lookup, user-agent parsing, and session ID generation).
+  Functional Requirements (FR)
+  * Multi-Source Ingestion: Support high-throughput data collection from mobile (iOS/Android) and web clients via SDKs or HTTP APIs.
+  * Schema Governance & Evolution: Implement a centralized Event Catalog and Schema Registry to manage event definitions and versioning across various app releases.
+  * Data Validation & Quarantine: Automatically validate incoming events against registered schemas; invalid events must be routed to a Dead Letter Queue (DLQ) or "Quarantine" zone for inspection without stopping the main pipeline.
+  * Open Lakehouse Storage: Persist ingested data into Apache Iceberg tables, supporting ACID transactions, schema evolution, and time-travel queries.
+  * Event Enrichment: Support basic at-ingest enrichment (e.g., Geo-IP lookup, user-agent parsing, and session ID generation).
 
-Non-Functional Requirements (NFR)
-Scalability: Support peak ingestion of $200,000+$ events per second with the ability to handle $3\times$ bursts during holiday or marketing events.
-Availability: $99.99\%$ availability for the ingestion endpoints to ensure no user behavioral data is lost.
-Data Freshness: Achieving "near real-time" availability in the Lakehouse (1–5 minute latency from event trigger to queryable state).
-Durability & Reliability: Zero data loss after the system acknowledges an event; support for exactly-once or at-least-once delivery semantics.
-Cost-Efficiency: Optimize storage and compute costs by utilizing tiered storage and file compaction.
+  Non-Functional Requirements (NFR)
+  * Scalability: Support peak ingestion of $200,000+$ events per second with the ability to handle $3\times$ bursts during holiday or marketing events.
+  * Availability: $99.99\%$ availability for the ingestion endpoints to ensure no user behavioral data is lost.
+  * Data Freshness: Achieving "near real-time" availability in the Lakehouse (1–5 minute latency from event trigger to queryable state).
+  * Durability & Reliability: Zero data loss after the system acknowledges an event; support for exactly-once or at-least-once delivery semantics.
+  * Cost-Efficiency: Optimize storage and compute costs by utilizing tiered storage and file compaction.
 
 2. Architectural Components & Detailing
 
@@ -32,23 +33,23 @@ Cost-Efficiency: Optimize storage and compute costs by utilizing tiered storage 
 
 3. Nuanced Considerations for Staff-Level Roles
 
-Managing the "Small File Problem"
-Streaming data into Iceberg often creates thousands of tiny files, which degrades query performance due to metadata overhead. A Staff-level design must include an Automated Compaction Service that runs asynchronously to merge small files into optimal sizes (e.g., $256-512$ MB) and expire old snapshots to reclaim storage space.
+  * Managing the "Small File Problem"
+    Streaming data into Iceberg often creates thousands of tiny files, which degrades query performance due to metadata overhead. A Staff-level design must include an Automated Compaction Service that runs asynchronously to merge small files into optimal sizes (e.g., $256-512$ MB) and expire old snapshots to reclaim storage space.
 
-Data Contracts as an Organizational Wedge
-Instead of merely being a technical component, the Event Catalog should be presented as a "Data Contract" between product engineers (producers) and data scientists (consumers). Staff engineers should advocate for CI/CD integration where a PR to the mobile app is blocked if it introduces a breaking change to an event schema not approved in the registry.
+  * Data Contracts as an Organizational Wedge
+    Instead of merely being a technical component, the Event Catalog should be presented as a "Data Contract" between product engineers (producers) and data scientists (consumers). Staff engineers should advocate for CI/CD integration where a PR to the mobile app is blocked if it introduces a breaking change to an event schema not approved in the registry.
 
-Intelligent Handling of Invalid Events
-Rather than just dumping bad data, implement "Schema Drift as Data." This involves capturing unexpected fields into a "shadow" or "quarantine" table. This allows engineers to investigate if a new app version is sending unmapped data (intent) or if a bug has been introduced (corruption) without losing the data forever.
+  * Intelligent Handling of Invalid Events
+    Rather than just dumping bad data, implement "Schema Drift as Data." This involves capturing unexpected fields into a "shadow" or "quarantine" table. This allows engineers to investigate if a new app version is sending unmapped data (intent) or if a bug has been introduced (corruption) without losing the data forever.
 
-PII and Compliance at the Edge
-For global systems, privacy (GDPR/CCPA) must be handled at the point of ingestion. The system should support Edge-level Masking or Tokenization, where sensitive fields (e.g., IP addresses, emails) are hashed or redacted before they ever hit the persistent storage layer.
+  * PII and Compliance at the Edge
+    For global systems, privacy (GDPR/CCPA) must be handled at the point of ingestion. The system should support Edge-level Masking or Tokenization, where sensitive fields (e.g., IP addresses, emails) are hashed or redacted before they ever hit the persistent storage layer.
 
-Cost vs. Freshness Trade-offs
-A critical Staff-level insight is knowing when not to use real-time streaming. The design should allow for "Micro-batch" ingestion for non-critical events (e.g., background impressions) while reserving the high-cost streaming paths for critical signals like conversion or fraud detection.
+  * Cost vs. Freshness Trade-offs
+    A critical Staff-level insight is knowing when not to use real-time streaming. The design should allow for "Micro-batch" ingestion for non-critical events (e.g., background impressions) while reserving the high-cost streaming paths for critical signals like conversion or fraud detection.
 
-Reliability through Idempotency
-Ensure the entire pipeline is idempotent. Use globally unique event_ids (UUIDs/ULIDs) generated at the client side to handle retries from mobile apps (which may happen due to spotty network) without duplicating data in the final silver/gold tables.
+  * Reliability through Idempotency
+    Ensure the entire pipeline is idempotent. Use globally unique event_ids (UUIDs/ULIDs) generated at the client side to handle retries from mobile apps (which may happen due to spotty network) without duplicating data in the final silver/gold tables.
 
 -----
 
