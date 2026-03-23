@@ -267,6 +267,29 @@ CREATE INDEX ON identity_aliases (tenant_id, canonical_uid);
 
 Redis hot layer: `HSET tenant:{tenant_id}:alias:{anonymous_id} canonical_uid {uid}` — O(1) lookup, TTL 24h.
 
+> **Q:** What does identity graph actually contain? How is this relevant in answering funnel queries?
+>
+>> **A:** The identity graph is a mapping table: **anonymous_id → canonical_uid**. That's it at its core. Each row says "device/session ID X belongs to the same person as canonical user Y."
+>>
+>> **Why it exists:** A single user typically generates events under multiple IDs before you can stitch them together:
+>> - Pre-login mobile session: `anon_id = device-uuid-abc`
+>> - Post-login web session: `anon_id = session-xyz`, resolved to `canonical_uid = user-123`
+>> - The `identify()` call (e.g. from Segment/Mixpanel SDK) creates the alias row linking `device-uuid-abc → user-123`
+>>
+>> **How it's used in funnel queries:**
+>>
+>> The events table stores `canonical_uid` (resolved at write time if possible, or at query time). The problem is historical events written *before* the identity merge happened still carry the old `anonymous_id`. So at query time:
+>>
+>> 1. Query API receives funnel request
+>> 2. Looks up all `anonymous_id`s that map to the target `canonical_uid`s (or vice versa for cohort filters)
+>> 3. Injects the full alias set as an additional filter: `WHERE canonical_uid IN ('user-123', 'device-uuid-abc', 'session-xyz')`
+>> 4. ClickHouse scans events for all those IDs — the `ORDER BY (tenant_id, canonical_uid, event_time)` sort key means they're physically adjacent on disk
+>> 5. `windowFunnel` then sees the merged, time-ordered event stream as if it were a single user
+>>
+>> **Why not rewrite historical events on merge?** Immutability. Rewriting petabytes of Iceberg/ClickHouse data every time two IDs are linked is operationally catastrophic. Query-time resolution is a deliberate trade-off: slightly more complex queries, but zero write amplification on identity events.
+>>
+>> **The schema in this doc** (`identity_aliases`) is the minimal version. A fuller identity graph would also store edge metadata (merge confidence score, merge source like `identify_call` vs `email_match`), and support multi-hop chains (anon-A → anon-B → canonical-C) via a graph traversal or pre-flattened transitive closure table.
+
 ### 4.3 Funnel Definition Schema (PostgreSQL)
 
 ```sql
@@ -339,6 +362,170 @@ ORDER BY level;
 
 `windowFunnel` is O(n) per user — it scans the sorted event stream once, tracking the furthest step reached within the conversion window. No self-join, no subquery explosion.
 
+> **Q:** How would funnel query look like if there were windowFunnel function in Clickhouse?
+>
+>> **A:** Interpreting this as "if there were **no** `windowFunnel`" — you'd have to implement the temporal sequence match manually using self-joins or window functions. Here's the equivalent for the same 3-step funnel:
+>>
+>> ```sql
+>> -- Step 1: find first page_view per user
+>> WITH s1 AS (
+>>     SELECT canonical_uid, min(event_time) AS t1
+>>     FROM events
+>>     WHERE tenant_id = 'acme'
+>>       AND date BETWEEN '2026-02-21' AND '2026-03-23'
+>>       AND event_name = 'page_view'
+>>     GROUP BY canonical_uid
+>> ),
+>> -- Step 2: first add_to_cart AFTER t1 and within 7 days
+>> s2 AS (
+>>     SELECT e.canonical_uid, min(e.event_time) AS t2
+>>     FROM events e
+>>     JOIN s1 ON e.canonical_uid = s1.canonical_uid
+>>     WHERE e.tenant_id = 'acme'
+>>       AND e.event_name = 'add_to_cart'
+>>       AND e.event_time > s1.t1
+>>       AND e.event_time <= s1.t1 + INTERVAL 7 DAY
+>>     GROUP BY e.canonical_uid
+>> ),
+>> -- Step 3: first purchase AFTER t2 and within 7 days of t1
+>> s3 AS (
+>>     SELECT e.canonical_uid, min(e.event_time) AS t3
+>>     FROM events e
+>>     JOIN s2 ON e.canonical_uid = s2.canonical_uid
+>>     JOIN s1 ON e.canonical_uid = s1.canonical_uid
+>>     WHERE e.tenant_id = 'acme'
+>>       AND e.event_name = 'purchase'
+>>       AND e.event_time > s2.t2
+>>       AND e.event_time <= s1.t1 + INTERVAL 7 DAY
+>>     GROUP BY e.canonical_uid
+>> )
+>> SELECT
+>>     1 AS level, count(DISTINCT s1.canonical_uid) AS users FROM s1
+>> UNION ALL
+>>     SELECT 2, count(DISTINCT s2.canonical_uid) FROM s2
+>> UNION ALL
+>>     SELECT 3, count(DISTINCT s3.canonical_uid) FROM s3
+>> ORDER BY level;
+>> ```
+>>
+>> **Why this is painful at scale:**
+>> - Each CTE step is a **full scan + join** back to the events table — O(n) scans × N steps = O(n²) for an N-step funnel
+>> - For N=5 steps over 30 days of data, you're doing 5 separate shuffle joins across potentially billions of rows
+>> - No way to short-circuit: even users who dropped at step 1 are re-scanned at step 2 join
+>> - Query plan explodes combinatorially for "any order" funnels (need to enumerate all N! orderings)
+>>
+>> `windowFunnel` avoids all of this by doing a **single sorted scan per user** in C++ inside the aggregation kernel — the sort is already baked into the MergeTree `ORDER BY` key, so it's essentially free.
+
+> **Q:** If batch were to answered for Iceberg tables through Trino or Spark, how would funnel query look like? Assume that there is Clickhouse in the architecture and latency of querying Iceberg tables is acceptable.
+>
+>> **A:** Without `windowFunnel`, you're back to the self-join CTE pattern — but Trino and Spark both have `MATCH_RECOGNIZE` (Trino) or window functions that make it less ugly. Here's the idiomatic approach for each.
+>>
+>> **Trino — using `MATCH_RECOGNIZE` (cleanest option):**
+>>
+>> ```sql
+>> SELECT
+>>     match_id,
+>>     count(DISTINCT CASE WHEN step >= 1 THEN canonical_uid END) AS step1_users,
+>>     count(DISTINCT CASE WHEN step >= 2 THEN canonical_uid END) AS step2_users,
+>>     count(DISTINCT CASE WHEN step >= 3 THEN canonical_uid END) AS step3_users
+>> FROM (
+>>     SELECT canonical_uid, step
+>>     FROM events
+>>     MATCH_RECOGNIZE (
+>>         PARTITION BY canonical_uid
+>>         ORDER BY event_time
+>>         MEASURES
+>>             MATCH_NUMBER() AS match_id,
+>>             CLASSIFIER() AS step_name,
+>>             MATCH_NUMBER() AS step
+>>         ALL ROWS PER MATCH
+>>         AFTER MATCH SKIP PAST LAST ROW
+>>         PATTERN (A B? C?)
+>>         DEFINE
+>>             A AS event_name = 'page_view',
+>>             B AS event_name = 'add_to_cart'
+>>                 AND event_time <= A.event_time + INTERVAL '7' DAY,
+>>             C AS event_name = 'purchase'
+>>                 AND event_time <= A.event_time + INTERVAL '7' DAY
+>>     )
+>>     WHERE tenant_id = 'acme'
+>>       AND date BETWEEN DATE '2026-02-21' AND DATE '2026-03-23'
+>> )
+>> ```
+>>
+>> `MATCH_RECOGNIZE` is SQL:2016 standard, supported in Trino natively. It partitions by `canonical_uid`, sorts by `event_time`, and pattern-matches the sequence in one pass per user — semantically equivalent to `windowFunnel`.
+>>
+>> **Spark SQL — window function approach (more portable):**
+>>
+>> ```sql
+>> WITH ranked AS (
+>>     SELECT
+>>         canonical_uid,
+>>         event_name,
+>>         event_time,
+>>         -- tag each event with which funnel step it satisfies
+>>         CASE event_name
+>>             WHEN 'page_view'   THEN 1
+>>             WHEN 'add_to_cart' THEN 2
+>>             WHEN 'purchase'    THEN 3
+>>         END AS funnel_step,
+>>         -- first occurrence of each step per user
+>>         MIN(event_time) OVER (
+>>             PARTITION BY canonical_uid,
+>>             CASE event_name
+>>                 WHEN 'page_view'   THEN 1
+>>                 WHEN 'add_to_cart' THEN 2
+>>                 WHEN 'purchase'    THEN 3
+>>             END
+>>         ) AS first_step_time
+>>     FROM events
+>>     WHERE tenant_id = 'acme'
+>>       AND date BETWEEN '2026-02-21' AND '2026-03-23'
+>>       AND event_name IN ('page_view', 'add_to_cart', 'purchase')
+>> ),
+>> per_user AS (
+>>     SELECT
+>>         canonical_uid,
+>>         MAX(CASE WHEN funnel_step = 1 THEN first_step_time END) AS t1,
+>>         MAX(CASE WHEN funnel_step = 2 THEN first_step_time END) AS t2,
+>>         MAX(CASE WHEN funnel_step = 3 THEN first_step_time END) AS t3
+>>     FROM ranked
+>>     GROUP BY canonical_uid
+>> ),
+>> levels AS (
+>>     SELECT
+>>         canonical_uid,
+>>         CASE
+>>             WHEN t1 IS NOT NULL
+>>              AND t2 > t1
+>>              AND t3 > t2
+>>              AND t3 <= t1 + INTERVAL 7 DAYS THEN 3
+>>             WHEN t1 IS NOT NULL
+>>              AND t2 > t1
+>>              AND t2 <= t1 + INTERVAL 7 DAYS THEN 2
+>>             WHEN t1 IS NOT NULL THEN 1
+>>             ELSE 0
+>>         END AS level
+>>     FROM per_user
+>> )
+>> SELECT level, count(*) AS users
+>> FROM levels
+>> WHERE level > 0
+>> GROUP BY level ORDER BY level;
+>> ```
+>>
+>> **Key operational differences vs. ClickHouse `windowFunnel`:**
+>>
+>> | Dimension | Trino/Spark on Iceberg | ClickHouse `windowFunnel` |
+>> |---|---|---|
+>> | Latency | 10–60s (shuffle + S3 I/O) | <3s (local MergeTree scan) |
+>> | Shuffle cost | High — `PARTITION BY canonical_uid` triggers a full shuffle across workers | Zero — data already sorted by `canonical_uid` on disk |
+>> | Iceberg partition pruning | Yes — `date` partition prunes files before scan | Yes — ClickHouse partition key does same |
+>> | Conversion window enforcement | Manual (`t2 > t1 AND t2 <= t1 + 7 DAYS`) | Built into `windowFunnel(window_seconds)` |
+>> | Multi-step "any order" | Requires N! UNION ALL or MATCH_RECOGNIZE with alternation | `windowFunnel(..., STRICT_ORDER=0)` flag |
+>>
+>> **When you'd actually use Trino/Spark here:** Historical backfills beyond ClickHouse's warm tier (>90 days in cold Iceberg), or ad-hoc analyst queries that don't need <3s SLA. The Query API can route based on time range: `date < now() - 90d → Trino`, else `→ ClickHouse`.
+
 ### Identity Resolution at Query Time
 
 ```
@@ -350,6 +537,106 @@ ORDER BY level;
 ```
 
 This avoids rewriting historical events when a new alias is discovered — the identity graph is the source of truth, not the event table.
+
+> **Q:** Where is identity resolution used in funnel query? Provide an example. How does the Clickhouse query with windowFunnel function look like with identity resolution at query time?
+>
+>> **A:** Identity resolution is used **before the ClickHouse query is issued**, in the Query API layer. It's not inside the SQL — it's a pre-processing step that expands the set of IDs to query.
+>>
+>> **Concrete example:**
+>>
+>> User `alice@example.com` (canonical_uid = `user-123`) browsed anonymously on mobile before logging in:
+>>
+>> | anonymous_id | canonical_uid | event |
+>> |---|---|---|
+>> | `device-abc` | *(not yet known)* | `page_view` at T=0 |
+>> | `session-xyz` | `user-123` | `add_to_cart` at T=2h |
+>> | `session-xyz` | `user-123` | `purchase` at T=3h |
+>>
+>> After the `identify()` call, the identity graph records: `device-abc → user-123`.
+>>
+>> Without identity resolution, the funnel query only sees `user-123`'s events (step 2 + 3) and counts Alice as a **drop-off at step 1**. With resolution, it also pulls `device-abc`'s `page_view` and correctly counts her as a **full conversion**.
+>>
+>> **Query API pre-processing (pseudocode):**
+>>
+>> ```python
+>> # 1. Start with the canonical_uid from the funnel request
+>> canonical_uids = ['user-123']
+>>
+>> # 2. Reverse-lookup: find all anonymous_ids that map to these canonical_uids
+>> # Redis: SMEMBERS tenant:acme:canonical:user-123:aliases
+>> alias_ids = redis.smembers('tenant:acme:canonical:user-123:aliases')
+>> # → {'device-abc', 'session-xyz'}
+>>
+>> # 3. Union: all IDs that represent this user
+>> all_ids = canonical_uids + list(alias_ids)
+>> # → ['user-123', 'device-abc', 'session-xyz']
+>> ```
+>>
+>> **Resulting ClickHouse query with `windowFunnel` + identity resolution:**
+>>
+>> ```sql
+>> SELECT
+>>     level,
+>>     count() AS users
+>> FROM (
+>>     SELECT
+>>         -- normalize: treat all aliases as the same user
+>>         canonical_uid,
+>>         windowFunnel(604800)(   -- 7-day conversion window
+>>             event_time,
+>>             event_name = 'page_view',
+>>             event_name = 'add_to_cart',
+>>             event_name = 'purchase'
+>>         ) AS level
+>>     FROM events
+>>     WHERE
+>>         tenant_id = 'acme'
+>>         AND date BETWEEN '2026-02-21' AND '2026-03-23'
+>>         AND event_name IN ('page_view', 'add_to_cart', 'purchase')
+>>         -- identity resolution injected here by Query API
+>>         AND canonical_uid IN ('user-123', 'device-abc', 'session-xyz')
+>>     GROUP BY canonical_uid
+>> )
+>> GROUP BY level
+>> ORDER BY level;
+>> ```
+>>
+>> **Why `canonical_uid IN (...)` works:** The events table `ORDER BY (tenant_id, canonical_uid, event_time)` physically co-locates all rows for `device-abc`, `session-xyz`, and `user-123` near each other within the partition. ClickHouse scans each ID's block independently, and `windowFunnel` runs per `canonical_uid` group — so `device-abc`'s `page_view` and `user-123`'s `add_to_cart`/`purchase` are each in their own group.
+>>
+>> **Wait — that means they're still in separate groups!** Correct. For a single-user funnel (cohort of 1), you'd need to also **rewrite `canonical_uid` to the resolved value at write time** for pre-login events, OR do a final merge step:
+>>
+>> ```sql
+>> -- Option: coalesce all aliases to canonical_uid at scan time
+>> SELECT
+>>     level,
+>>     count() AS users
+>> FROM (
+>>     SELECT
+>>         -- map any alias back to canonical at query time
+>>         multiIf(
+>>             canonical_uid = 'device-abc', 'user-123',
+>>             canonical_uid = 'session-xyz', 'user-123',
+>>             canonical_uid
+>>         ) AS resolved_uid,
+>>         windowFunnel(604800)(
+>>             event_time,
+>>             event_name = 'page_view',
+>>             event_name = 'add_to_cart',
+>>             event_name = 'purchase'
+>>         ) AS level
+>>     FROM events
+>>     WHERE
+>>         tenant_id = 'acme'
+>>         AND date BETWEEN '2026-02-21' AND '2026-03-23'
+>>         AND event_name IN ('page_view', 'add_to_cart', 'purchase')
+>>         AND canonical_uid IN ('user-123', 'device-abc', 'session-xyz')
+>>     GROUP BY resolved_uid   -- ← all aliases now merged into one group
+>> )
+>> GROUP BY level
+>> ORDER BY level;
+>> ```
+>>
+>> The Query API generates the `multiIf(...)` expression dynamically from the alias map. This is the critical step — without it, `windowFunnel` sees fragmented per-alias event streams instead of the merged timeline.
 
 ---
 

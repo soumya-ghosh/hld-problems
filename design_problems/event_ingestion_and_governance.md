@@ -33,22 +33,22 @@
 
 3. Nuanced Considerations for Staff-Level Roles
 
-  * Managing the "Small File Problem"
+  * Managing the "Small File Problem": 
     Streaming data into Iceberg often creates thousands of tiny files, which degrades query performance due to metadata overhead. A Staff-level design must include an Automated Compaction Service that runs asynchronously to merge small files into optimal sizes (e.g., $256-512$ MB) and expire old snapshots to reclaim storage space.
 
-  * Data Contracts as an Organizational Wedge
+  * Data Contracts as an Organizational Wedge: 
     Instead of merely being a technical component, the Event Catalog should be presented as a "Data Contract" between product engineers (producers) and data scientists (consumers). Staff engineers should advocate for CI/CD integration where a PR to the mobile app is blocked if it introduces a breaking change to an event schema not approved in the registry.
 
-  * Intelligent Handling of Invalid Events
+  * Intelligent Handling of Invalid Events: 
     Rather than just dumping bad data, implement "Schema Drift as Data." This involves capturing unexpected fields into a "shadow" or "quarantine" table. This allows engineers to investigate if a new app version is sending unmapped data (intent) or if a bug has been introduced (corruption) without losing the data forever.
 
-  * PII and Compliance at the Edge
+  * PII and Compliance at the Edge: 
     For global systems, privacy (GDPR/CCPA) must be handled at the point of ingestion. The system should support Edge-level Masking or Tokenization, where sensitive fields (e.g., IP addresses, emails) are hashed or redacted before they ever hit the persistent storage layer.
 
-  * Cost vs. Freshness Trade-offs
+  * Cost vs. Freshness Trade-offs: 
     A critical Staff-level insight is knowing when not to use real-time streaming. The design should allow for "Micro-batch" ingestion for non-critical events (e.g., background impressions) while reserving the high-cost streaming paths for critical signals like conversion or fraud detection.
 
-  * Reliability through Idempotency
+  * Reliability through Idempotency: 
     Ensure the entire pipeline is idempotent. Use globally unique event_ids (UUIDs/ULIDs) generated at the client side to handle retries from mobile apps (which may happen due to spotty network) without duplicating data in the final silver/gold tables.
 
 -----
