@@ -597,6 +597,23 @@ The certificate is stored in S3 with Object Lock (WORM) enabled — it cannot be
 | **Signal / wait for human** | Temporal Signals natively pause a workflow | Requires sensor tasks or external callbacks |
 | **Verdict** | ✅ Preferred | Used only as batch scheduler for Parquet jobs |
 
+> **Q:** Why both Temporal and Airflow are required? Can Temporal be used as batch scheduler for Spark jobs?
+>
+>> **A:** Temporal *can* launch Spark jobs — you'd write an activity that calls the Spark submit API or the Kubernetes operator and polls for job completion. It's technically valid. The reason Airflow is retained for Parquet batch jobs specifically comes down to **the nature of the two workloads being fundamentally different**:
+>>
+>> | | Temporal (per-request workflow) | Airflow (batch scheduler) |
+>> |---|---|---|
+>> | **Granularity** | One workflow per `request_id` (50K/day) | One DAG run per dataset partition (dozens/day) |
+>> | **Trigger model** | Event-driven (deletion request arrives) | Time-driven (every 6h, collect accumulated tasks) |
+>> | **Job purpose** | Coordinate *individual* deletion steps | Aggregate *many* pending tasks, coalesce into one Spark job |
+>> | **Spark integration** | Possible but awkward — which workflow "owns" the shared Spark job? | Natural — one DAG run = one batch Spark job covering N users |
+>>
+>> The core tension is **fan-in**. Parquet rewrite is deliberately batched to amortize Spark job overhead: instead of 10,000 individual Spark jobs (one per Temporal workflow), you want one Spark job that reads a partition once and filters out all 10,000 users in a single pass. That coalescing logic — "collect all pending rewrite tasks for this partition, then fire one job" — is a scheduler concern, not a per-request workflow concern.
+>>
+>> In Temporal, there's no clean owner for that aggregation. You'd need a separate "batch coordinator" workflow that polls the DB, which is exactly what Airflow already does well with its sensor tasks and scheduled DAGs.
+>>
+>> **If you wanted to drop Airflow entirely**, you could replace it with a Temporal Cron Workflow that runs every 6h, queries pending PARQUET_REWRITE tasks, groups them, and submits a Spark job via the K8s operator activity. That's a reasonable simplification — it just means your team needs to be comfortable owning that scheduling logic inside Temporal instead of Airflow's UI/observability. Either is valid; the doc uses Airflow because most data platform teams already have it running.
+
 ### Kafka vs. Direct Temporal Worker Polling
 
 Kafka is used between the Temporal orchestrator and deletion workers to decouple worker scaling from workflow throughput. This allows Parquet batch workers (heavy, few) and RDBMS workers (light, many) to scale independently without tuning Temporal's worker concurrency. Workers own their consumer group lag and can apply backpressure naturally.
