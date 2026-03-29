@@ -222,7 +222,7 @@ flowchart TB
     AF -->|trigger| SP
     AF -->|staging run| STAGE
     SP -->|read| S3S
-    SP -->|write (partition overwrite)| S3G
+    SP -->|"write <br>(partition overwrite)"| S3G
     S3G -->|post-compute load| CH
     CH --> API
     API --> CACHE
