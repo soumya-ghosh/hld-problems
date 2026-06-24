@@ -74,6 +74,18 @@ In a live interview I would stop here. Since this is a document, I state the que
 **Read QPS**
 - If we naively let clients poll every 2 s and there are 50 M clients: 25 M reads/s — impossible at origin. With **edge caching (2–3 s TTL)** the origin sees ~(#streams × #edge-PoPs / TTL). For ~5,000 live streams × 50 PoPs / 2 s ≈ **125 K origin reads/s** — trivial. WebSocket push reduces it further. **The edge cache is what makes the read path tractable**, not origin scaling.
 
+> **Q:** What is PoP here? Also does the web socket maintain connections with end user devices (browsers, apps) and push these live stream watching metrics?
+>
+>> **A:** **PoP = Point of Presence** — a CDN edge location (a cluster of edge servers in a city/metro, e.g. Mumbai, Singapore, Frankfurt). A CDN like CloudFront/Akamai/Fastly has dozens to hundreds of them worldwide. The "× 50 PoPs" in §2.1 assumes each PoP independently caches the count for a stream, so the origin is hit at most once per PoP per TTL window. More PoPs = more total edge cache copies = slightly more origin reads, but each region's users get served locally with low latency.
+>>
+>> On the WebSocket question — **two distinct serving models**, and the answer depends on which:
+>>
+>> - **WebSocket push (direct to devices):** Yes — the **WebSocket Fanout** tier holds a long-lived persistent connection to each subscribed browser/app and pushes the updated count (typically a small delta message) whenever it changes, every ~1–2 s. This avoids client polling entirely. The tradeoff: holding **tens of millions of concurrent sockets** is expensive — it needs a horizontally-scaled connection tier (e.g. many nodes each holding ~100K–1M sockets), a pub/sub backbone (Redis pub/sub / Kafka) to route "stream X count changed" to the right sockets, and sticky routing. This is the **low-latency path** for first-party surfaces (the player's live scoreboard overlay).
+>>
+>> - **CDN edge cache (pull):** The count is just a tiny JSON/number behind a REST URL with a 2–3 s TTL. The device (or a third-party embed, or CDN cache-population) **polls** that URL; the CDN serves it from the nearest PoP and only refreshes from origin once per TTL. No persistent connection — cheaper and infinitely scalable, at the cost of up-to-TTL staleness and per-request overhead.
+>>
+>> **In practice you use both:** WebSocket for the primary in-app experience where freshness matters, CDN/REST as the scalable fallback for everything that can't or shouldn't hold a socket. Both stay within the ≤ 5 s staleness budget (NFR-3). See §4.6 *Push vs. Pull*.
+
 ### 2.2 Core Components
 
 ```
@@ -213,6 +225,68 @@ global:total              → platform-wide sum
 ### 4.4 Flink vs. Spark Streaming vs. Kafka Streams
 
 **Chose Flink.** True per-event streaming with **event-time windows + watermarks**, first-class **keyed state with TTL** (exactly our session-expiry model), exactly-once via checkpointing/barriers (NFR-8 ≤30 s loss = checkpoint interval), and proven at this scale. Spark Structured Streaming is micro-batch (higher floor latency, clumsier TTL state). Kafka Streams is great but co-locating this much state and rebalancing under spikes is operationally harder than Flink's managed state + savepoints.
+
+> **Q:** Elaborate on the window type being used here? Is it a sliding window of 90 seconds sliding every 1-2 seconds or a session window? When are the results emitted. Present a simple pseudo code for the same.
+>
+>> **A:** Good catch — the doc uses "window" loosely. The cleanest model here is **neither a classic sliding window nor Flink's built-in session window**. It's a **keyed `ProcessFunction` with state TTL + a periodic emit timer**. Here's why, and what each alternative would actually do:
+>>
+>> **Why not a 90 s sliding window (slide 1–2 s)?** A `SlidingEventTimeWindows(90s, 2s)` would create **45 overlapping window panes** per key (90/2), and every event lands in all 45. At 10 M events/s that's a 45× state and compute blow-up — exactly the write amplification we're trying to avoid (NFR-7). Rejected.
+>>
+>> **Why not Flink's `SessionWindow`?** A session window groups events separated by a gap and **fires when the gap elapses** — i.e. it emits *when a session ends*. We want the opposite: a **continuously-updated live count of currently-active sessions**, emitted every 1–2 s regardless of whether anyone left. Session windows also key per-session, not per-stream, so they don't give us "distinct active sessions per stream" directly. Wrong tool.
+>>
+>> **What we actually want — two independent time concepts:**
+>>
+>> - **Liveness = per-session TTL of 90 s.** Each `session_id` is "alive" if seen in the last 90 s. This is **state TTL**, not a window. A heartbeat refreshes the TTL; 90 s of silence expires it. (This is the "concurrent viewer" definition from §1.3.)
+>> - **Emit cadence = every 1–2 s.** A **processing-time timer** per `(stream, shard)` fires on a fixed interval and flushes the *current* count — decoupled from when sessions join/leave. This is a **tumbling trigger over continuously-maintained state**, not a window over the events.
+>>
+>> So: **state-TTL for membership + periodic timer for emission.** The "1-min tumbling window" mentioned elsewhere is a *separate, coarser* aggregation for the OLAP/history path (FR-3/FR-8) — don't conflate it with the live-count path.
+>>
+>> **Pseudocode** (Flink `KeyedProcessFunction`, keyed by `(stream_id, shard)`):
+>>
+>> ```python
+>> # key = (stream_id, shard);  STATE persists per key
+>> #   hll          : HyperLogLog sketch of active session_ids
+>> #   last_seen    : MapState[session_id -> last_heartbeat_server_ts]
+>> TTL          = 90_000   # ms — session liveness window
+>> EMIT_EVERY   = 2_000    # ms — flush cadence to Redis
+>>
+>> def process_element(event, ctx):
+>>     # 'leave' is an optimization; absence of heartbeats also expires via TTL
+>>     if event.type == "leave":
+>>         last_seen.remove(event.session_id)
+>>         # note: HLL can't delete; see rebuild note below
+>>     else:  # join | keepalive
+>>         last_seen.put(event.session_id, event.server_ts)
+>>         hll.add(event.session_id)
+>>
+>>     # register the periodic emit timer once
+>>     if not emit_timer_registered.value():
+>>         ctx.timer_service().register_processing_time_timer(
+>>             align_to_next(EMIT_EVERY))
+>>         emit_timer_registered.update(True)
+>>
+>> def on_timer(ts, ctx):
+>>     now = ctx.timer_service().current_processing_time()
+>>
+>>     # expire sessions silent for > TTL
+>>     for sid, last in list(last_seen.entries()):
+>>         if now - last > TTL:
+>>             last_seen.remove(sid)
+>>
+>>     # emit current active count for this (stream, shard)
+>>     count = hll.estimate()            # display path (±2%)
+>>     flush_to_redis(key, hll, count)   # stream:{id}:shard:{k}
+>>
+>>     # re-arm the timer
+>>     ctx.timer_service().register_processing_time_timer(now + EMIT_EVERY)
+>> ```
+>>
+>> **One honest wrinkle — HLL can't delete.** A plain HLL only supports add, so expired sessions don't shrink it; over a long stream the sketch would drift upward. Two standard fixes:
+>>
+>> 1. **Sliding HLL / rebuild on emit:** keep the exact `last_seen` map (authoritative for liveness) and **rebuild a fresh HLL from live sessions each emit** — or maintain a small ring of per-second mini-sketches and `PFMERGE` only the last 90 s' worth. This bounds the sketch to the live window.
+>> 2. **Use a deletable sketch** (e.g. a Sliding-HyperLogLog or a counting variant) if exactness of decay matters more than memory.
+>>
+>> At Hotstar scale option 1 (rebuild from the bounded live-session map, which is at most ~25 M entries per hot stream **spread across `S` shards** so far smaller per key) is the pragmatic choice and keeps the ±2% guarantee honest.
 
 ### 4.5 CAP positioning
 
